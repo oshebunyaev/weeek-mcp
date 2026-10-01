@@ -3,6 +3,9 @@
 
     @mcp path /mcp
     handle @mcp {
+        request_body {
+            max_size 1MB
+        }
         reverse_proxy weeek-mcp:8000
     }
 

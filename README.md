@@ -46,16 +46,30 @@ Streamable HTTP transport. HTTP exposes exactly `/mcp` and the unauthenticated
 
 - `WEEEK_ALLOW_WRITE=false` is the default. In this mode only read tools are advertised.
 - HTTP startup fails unless `MCP_AUTH_TOKEN` and `WEEEK_ALLOWED_WORKSPACE_ID` are set.
-- `WEEEK_READ_PROJECT_IDS` optionally filters task/project reads. Enabling writes requires a non-empty `WEEEK_WRITE_PROJECT_IDS` whitelist.
+- `WEEEK_READ_PROJECT_IDS` applies a fail-closed subset policy: objects with unknown, empty, mixed allowed/denied, or otherwise unprovable project ownership are not returned. Enabling writes requires a non-empty `WEEEK_WRITE_PROJECT_IDS` whitelist.
+- The Public API does not expose an attachment-to-task/project relationship. Therefore `weeek_get_attachment` is not advertised and is rejected whenever `WEEEK_READ_PROJECT_IDS` is configured.
+- Public task payloads expose workspace-wide custom-field metadata without a trustworthy field-to-project mapping. `weeek_list_custom_fields` is likewise disabled under a project read allowlist.
+- Workspace-wide identity/member reads are disabled unless `WEEEK_ALLOW_WORKSPACE_READS=true`; they are not represented as project-scoped operations.
 - Direct write tools are not advertised. Each permitted write is exposed as `propose_weeek_*`; it validates scope, reads the current object, returns a preview and a one-time token, and performs no mutation.
-- `confirm_write` accepts only that token. The original payload is loaded from SQLite, scope is checked again, and the token is atomically consumed before execution. Default TTL is 10 minutes.
+- `confirm_write` accepts only that token. The original payload is loaded from SQLite, credential, scope, related objects, and upstream-state fingerprints are checked again, then the proposal is atomically claimed. Durable states distinguish `succeeded`, definite failure, and an indeterminate post-send outcome; an indeterminate proposal is never executed automatically again. Successful results are safe to fetch again. Default TTL is 10 minutes.
 - `weeek_delete_task`, `weeek_delete_task_comment`, and `weeek_kb_delete` are never exported.
 - Read tools and proposal tools carry `readOnlyHint=true`; `confirm_write` is annotated as modifying.
 
-The public task API token is created inside one WEEEK workspace and WEEEK scopes
-its requests to that workspace. `WEEEK_ALLOWED_WORKSPACE_ID` is the operator's
-explicit binding for that token. The KB client additionally compares the live
-browser-session workspace id with the configured id on every entry path.
+The documented Public API does **not** return a trustworthy workspace id for an
+API token. `WEEEK_ALLOWED_WORKSPACE_ID` is therefore an operator assertion, not
+a token-derived identity guarantee. The server makes the strongest documented
+check available: every configured project id must be visible to the credential,
+and proposals are bound to a fingerprint of that credential so token rotation
+invalidates them. Avoid reusing project allowlist configuration across
+workspaces. The KB client independently discovers the browser session's live
+workspace list through `/ws` and refuses a configured workspace that is absent;
+the Public API and KB session cannot silently select different configured ids.
+
+All endpoint identifiers are validated as canonical integers, UUIDs, or bounded
+opaque ids as appropriate, then encoded as path segments. Traversal, separators,
+query/fragment metacharacters, percent escapes, and control characters are
+rejected before an upstream request. MCP resource URIs must be exactly
+`weeek-kb://<document-id>`.
 
 ### Local stdio
 
@@ -163,6 +177,8 @@ a workaround.
 5. Rotate `WEEEK_EMAIL`/`WEEEK_PASSWORD` if they were ever configured, then remove them and keep `WEEEK_KB_AUTO_LOGIN=false`.
 6. Re-enable writes only after verifying workspace/project whitelists. Existing proposal tokens expire quickly; delete the proposals volume if immediate invalidation is required.
 
+Rotating `WEEEK_API_TOKEN` invalidates every still-pending proposal automatically.
+
 ## Installation
 
 ### Claude Desktop
@@ -241,6 +257,13 @@ Environment variables (or a `.env` file, see `.env.example`). Only `WEEEK_API_TO
 | Variable | Purpose |
 | --- | --- |
 | `WEEEK_API_TOKEN` | Task API token. Required for task tools. |
+| `WEEEK_ALLOWED_WORKSPACE_ID` | Mandatory remote deployment label and KB workspace boundary. Public API limitation: the token does not expose a verifiable workspace id. |
+| `WEEEK_READ_PROJECT_IDS` / `WEEEK_WRITE_PROJECT_IDS` | Fail-closed project allowlists. Writes require a non-empty write list. |
+| `WEEEK_ALLOW_WORKSPACE_READS` | Explicitly enable `whoami` and workspace member reads; default `false`. |
+| `MCP_ALLOWED_ORIGINS` | Comma-separated browser Origin allowlist. Omit when browser-origin MCP is not used. |
+| `MCP_MAX_REQUEST_BODY` | Backend request limit in bytes; default 1 MiB. Caddy also enforces 1 MB. |
+| `WEEEK_PROPOSAL_MAX_PAYLOAD` / `WEEEK_PROPOSAL_MAX_PENDING` / `WEEEK_PROPOSAL_MAX_TOTAL` | Per-proposal bytes, global pending quota, and bounded retained row count. Defaults 64 KiB / 100 / 1000. A single bearer token provides no reliable per-client identity, so quotas are global. |
+| `WEEEK_PROPOSAL_RETENTION` | Terminal proposal retention in seconds; default one day. Expired unused proposals are removed too. |
 | `WEEEK_EMAIL` / `WEEEK_PASSWORD` | First automated KB login. Optional (skip if 2FA/SSO — use `weeek-mcp-login`). |
 | `WEEEK_WORKSPACE_ID` | KB workspace id. Optional — auto-detected via `/ws` when unset. |
 | `WEEEK_STORAGE_STATE` | Where the browser session is cached (defaults under `~/.local/state`). |
