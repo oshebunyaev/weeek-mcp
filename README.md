@@ -11,6 +11,7 @@ An [MCP](https://modelcontextprotocol.io) server for [Weeek](https://weeek.net):
 ## Contents
 
 - [Features](#features)
+- [Production remote MCP](#production-remote-mcp)
 - [Installation](#installation)
   - [Claude Desktop](#claude-desktop)
   - [Other MCP clients](#other-mcp-clients)
@@ -33,6 +34,134 @@ Full CRUD. Weeek has no public KB API, so the server calls Weeek's **internal JS
 ### Capability-aware
 
 Task tools appear when an API token is set; KB tools and resources appear when login credentials or a cached session are present.
+
+## Production remote MCP
+
+The server supports the original stdio transport and the MCP SDK's official
+Streamable HTTP transport. HTTP exposes exactly `/mcp` and the unauthenticated
+`/health` probe. Every `/mcp` request must carry `Authorization: Bearer
+<MCP_AUTH_TOKEN>`; secrets never belong in the URL.
+
+### Security model
+
+- `WEEEK_ALLOW_WRITE=false` is the default. In this mode only read tools are advertised.
+- HTTP startup fails unless `MCP_AUTH_TOKEN` and `WEEEK_ALLOWED_WORKSPACE_ID` are set.
+- `WEEEK_READ_PROJECT_IDS` optionally filters task/project reads. Enabling writes requires a non-empty `WEEEK_WRITE_PROJECT_IDS` whitelist.
+- Direct write tools are not advertised. Each permitted write is exposed as `propose_weeek_*`; it validates scope, reads the current object, returns a preview and a one-time token, and performs no mutation.
+- `confirm_write` accepts only that token. The original payload is loaded from SQLite, scope is checked again, and the token is atomically consumed before execution. Default TTL is 10 minutes.
+- `weeek_delete_task`, `weeek_delete_task_comment`, and `weeek_kb_delete` are never exported.
+- Read tools and proposal tools carry `readOnlyHint=true`; `confirm_write` is annotated as modifying.
+
+The public task API token is created inside one WEEEK workspace and WEEEK scopes
+its requests to that workspace. `WEEEK_ALLOWED_WORKSPACE_ID` is the operator's
+explicit binding for that token. The KB client additionally compares the live
+browser-session workspace id with the configured id on every entry path.
+
+### Local stdio
+
+Read-only is the default even locally:
+
+```bash
+python -m venv .venv
+. .venv/bin/activate
+pip install -e '.[kb]'
+playwright install chromium       # omit when KB is not needed
+export WEEEK_API_TOKEN='...'
+export MCP_TRANSPORT=stdio
+weeek-mcp
+```
+
+To test writes locally, also set `WEEEK_ALLOWED_WORKSPACE_ID`,
+`WEEEK_ALLOW_WRITE=true`, and `WEEEK_WRITE_PROJECT_IDS`.
+
+### WEEEK API token and workspace id
+
+In WEEEK open the target workspace, then **Settings → API**, create a token, and
+store it only as `WEEEK_API_TOKEN` on the host. Requests act as the user who
+created the token. Copy the workspace id from the workspace URL/application
+state and set it as `WEEEK_ALLOWED_WORKSPACE_ID`. Never bake `.env` into an image.
+
+### Seed the KB browser session
+
+The production path uses a pre-created Playwright `storage_state` file. On a
+trusted computer with a browser:
+
+```bash
+MCP_TRANSPORT=stdio \
+WEEEK_STORAGE_STATE="$PWD/secrets/storage_state.json" \
+uv run --extra kb playwright install chromium
+
+MCP_TRANSPORT=stdio \
+WEEEK_STORAGE_STATE="$PWD/secrets/storage_state.json" \
+uv run --extra kb weeek-mcp-login
+
+chmod 600 secrets/storage_state.json
+```
+
+Copy it to the VPS over an encrypted channel, then seed the persistent volume:
+
+```bash
+docker compose run --rm \
+  -v "$PWD/secrets/storage_state.json:/seed/storage_state.json:ro" \
+  weeek-mcp sh -c 'cp /seed/storage_state.json /data/session/storage_state.json && chmod 600 /data/session/storage_state.json'
+```
+
+`WEEEK_EMAIL`/`WEEEK_PASSWORD` are optional bootstrap credentials only.
+Production defaults to `WEEEK_KB_AUTO_LOGIN=false`; an expired session returns a
+clear error and must be reseeded instead of repeatedly logging in.
+
+### Docker + Caddy deployment
+
+```bash
+cp .env.example .env
+chmod 600 .env
+# Edit .env, point MCP_DOMAIN DNS at the VPS, then:
+docker compose up -d --build
+docker compose ps
+curl -fsS "https://${MCP_DOMAIN}/health"
+curl -i "https://${MCP_DOMAIN}/mcp"       # expected: 401
+```
+
+The MCP container has no published port. Caddy is the only Internet-facing
+service and terminates TLS for `https://weeek-mcp.example.com/mcp` and
+`/health`; every other path returns 404. `runtime` omits Playwright/Chromium;
+set `WEEEK_DOCKER_TARGET=runtime-kb` only when KB support is required. Browser
+state and pending proposals live in separate persistent volumes.
+
+### MCP Inspector and remote clients
+
+Start MCP Inspector and enter `https://weeek-mcp.example.com/mcp` as a
+Streamable HTTP server, adding the header `Authorization: Bearer <token>`:
+
+```bash
+npx @modelcontextprotocol/inspector
+```
+
+A generic remote-MCP client configuration is:
+
+```json
+{
+  "url": "https://weeek-mcp.example.com/mcp",
+  "headers": {"Authorization": "Bearer ${MCP_AUTH_TOKEN}"}
+}
+```
+
+The [OpenAI Responses API remote MCP tool](https://developers.openai.com/api/docs/guides/tools-connectors-mcp)
+accepts the same bearer value in its `authorization` field. ChatGPT's
+interactive plugin/connector flow currently expects [OAuth 2.1](https://developers.openai.com/plugins/build/auth)
+rather than a user-supplied static API key; for that UI, put an established
+OAuth-capable MCP gateway/identity provider in front of this server and have it
+forward the fixed upstream bearer credential. Do not make `/mcp` anonymous as
+a workaround.
+
+### Secret rotation
+
+1. Set `WEEEK_ALLOW_WRITE=false` and redeploy.
+2. Create a new WEEEK API token, replace `WEEEK_API_TOKEN`, redeploy, verify reads, then revoke the old token.
+3. Generate and deploy a new `MCP_AUTH_TOKEN`; update every client, then remove the old value from secret storage.
+4. Reseed `storage_state.json`, verify KB reads, then invalidate the old WEEEK browser sessions.
+5. Rotate `WEEEK_EMAIL`/`WEEEK_PASSWORD` if they were ever configured, then remove them and keep `WEEEK_KB_AUTO_LOGIN=false`.
+6. Re-enable writes only after verifying workspace/project whitelists. Existing proposal tokens expire quickly; delete the proposals volume if immediate invalidation is required.
 
 ## Installation
 
@@ -126,14 +255,16 @@ Environment variables (or a `.env` file, see `.env.example`). Only `WEEEK_API_TO
 | Group | Tools |
 | --- | --- |
 | Reading & navigation | `weeek_whoami`, `weeek_list_members`, `weeek_list_projects`, `weeek_list_boards`, `weeek_list_board_columns`, `weeek_list_tasks`, `weeek_get_task` |
-| Task lifecycle | `weeek_create_task`, `weeek_update_task`, `weeek_complete_task`, `weeek_uncomplete_task`, `weeek_delete_task`, `weeek_move_task` |
-| Assignees, watchers, hierarchy | `weeek_set_assignees`, `weeek_remove_assignees`, `weeek_set_watchers`, `weeek_remove_watchers`, `weeek_set_task_parent`, `weeek_add_task_to_project`, `weeek_remove_task_from_project` |
+| Task lifecycle | `propose_weeek_create_task`, `propose_weeek_update_task`, `propose_weeek_complete_task`, `propose_weeek_uncomplete_task`, `propose_weeek_move_task` + `confirm_write` |
+| Assignees, watchers, hierarchy | proposal forms of set/remove assignees, set/remove watchers, parent and project-location changes + `confirm_write` |
 | Time & attachments | `weeek_task_timer`, `weeek_manage_time_entry`, `weeek_upload_attachment`, `weeek_get_attachment` |
-| Fields & comments | `weeek_list_custom_fields`, `weeek_list_task_comments`, `weeek_add_task_comment`, `weeek_update_task_comment`, `weeek_delete_task_comment` |
+| Fields & comments | `weeek_list_custom_fields`, `weeek_list_task_comments`, proposal forms of add/update comment + `confirm_write` |
 
 ### Workspace admin
 
-`weeek_manage_tags`, `weeek_manage_projects`, `weeek_manage_boards`, `weeek_manage_board_columns`, `weeek_manage_portfolios`, `weeek_manage_custom_fields`.
+The upstream administrative tools remain in the codebase but are not advertised
+by the hardened server because their mixed action schemas include destructive
+operations that cannot be safely represented by the initial whitelist policy.
 
 These take an `action` (create/update/delete/…) rather than one tool per operation — the CRUD is regular and the tool list stays readable. Custom fields live per board, per project or workspace-wide, so that tool takes a `scope` (`global`/`project`/`board`) plus `scope_id`.
 
@@ -142,8 +273,8 @@ These take an `action` (create/update/delete/…) rather than one tool per opera
 | Group | Tools |
 | --- | --- |
 | Reading | `weeek_kb_search`, `weeek_kb_list`, `weeek_kb_read` |
-| Writing | `weeek_kb_create`, `weeek_kb_update`, `weeek_kb_delete` |
-| Formatting | `weeek_kb_table_widths`, `weeek_kb_icons` |
+| Writing | `propose_weeek_kb_create`, `propose_weeek_kb_update`, `propose_weeek_kb_move` + `confirm_write` |
+| Formatting | `propose_weeek_kb_table_widths` + `confirm_write`, `weeek_kb_icons` |
 
 > `weeek_kb_update` with new content writes into the document's shared Yjs document over
 > Weeek's collaborative websocket, because that — not REST — is where bodies are saved.
