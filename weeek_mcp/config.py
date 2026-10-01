@@ -72,6 +72,14 @@ class Config:
     write_project_ids: frozenset[int]
     proposals_db_path: Path
     proposal_ttl_seconds: int
+    proposal_max_payload_bytes: int
+    proposal_max_pending: int
+    proposal_max_total: int
+    proposal_retention_seconds: int
+    http_max_body_bytes: int
+    mcp_domain: str | None
+    allowed_origins: tuple[str, ...]
+    allow_workspace_reads: bool
 
     # --- Task management (public REST API) ---
     api_token: str | None
@@ -99,7 +107,7 @@ class Config:
         return bool(self.email and self.password)
 
     @classmethod
-    def from_env(cls) -> "Config":
+    def from_env(cls) -> Config:
         state = os.environ.get("WEEEK_STORAGE_STATE")
         transport = os.environ.get("MCP_TRANSPORT", "stdio").strip().lower()
         if transport not in ("stdio", "http"):
@@ -110,6 +118,8 @@ class Config:
             raise ValueError("MCP_AUTH_TOKEN is required when MCP_TRANSPORT=http")
         if transport == "http" and not allowed_workspace_id:
             raise ValueError("WEEEK_ALLOWED_WORKSPACE_ID is required when MCP_TRANSPORT=http")
+        if transport == "http" and not os.environ.get("MCP_DOMAIN"):
+            raise ValueError("MCP_DOMAIN is required when MCP_TRANSPORT=http")
         return cls(
             transport=transport,
             http_host=os.environ.get("MCP_HTTP_HOST", "127.0.0.1"),
@@ -121,6 +131,16 @@ class Config:
             write_project_ids=_ids("WEEEK_WRITE_PROJECT_IDS"),
             proposals_db_path=Path(os.environ.get("WEEEK_PROPOSALS_DB", str(_state_dir() / "proposals.sqlite3"))),
             proposal_ttl_seconds=int(os.environ.get("WEEEK_PROPOSAL_TTL", "600")),
+            proposal_max_payload_bytes=int(os.environ.get("WEEEK_PROPOSAL_MAX_PAYLOAD", "65536")),
+            proposal_max_pending=int(os.environ.get("WEEEK_PROPOSAL_MAX_PENDING", "100")),
+            proposal_max_total=int(os.environ.get("WEEEK_PROPOSAL_MAX_TOTAL", "1000")),
+            proposal_retention_seconds=int(os.environ.get("WEEEK_PROPOSAL_RETENTION", "86400")),
+            http_max_body_bytes=int(os.environ.get("MCP_MAX_REQUEST_BODY", "1048576")),
+            mcp_domain=os.environ.get("MCP_DOMAIN"),
+            allowed_origins=tuple(
+                value.strip() for value in os.environ.get("MCP_ALLOWED_ORIGINS", "").split(",") if value.strip()
+            ),
+            allow_workspace_reads=_bool("WEEEK_ALLOW_WORKSPACE_READS"),
             api_token=os.environ.get("WEEEK_API_TOKEN"),
             api_base=os.environ.get("WEEEK_API_BASE", DEFAULT_API_BASE).rstrip("/"),
             app_base=os.environ.get("WEEEK_APP_BASE", DEFAULT_APP_BASE).rstrip("/"),

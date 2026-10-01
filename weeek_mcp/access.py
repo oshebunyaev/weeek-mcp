@@ -5,6 +5,7 @@ from __future__ import annotations
 from typing import Any
 
 from .config import Config
+from .validation import opaque_id, positive_int
 from .weeek_api import WeeekAPI
 
 
@@ -29,14 +30,18 @@ class AccessPolicy:
     def workspace_id(self) -> str:
         if not self.cfg.allowed_workspace_id:
             raise AccessDenied("WEEEK_ALLOWED_WORKSPACE_ID is required for scoped access")
-        return self.cfg.allowed_workspace_id
+        return opaque_id(self.cfg.allowed_workspace_id, "WEEEK_ALLOWED_WORKSPACE_ID")
 
     def check_projects(self, project_ids: set[int], *, write: bool) -> None:
         allowed = self.cfg.write_project_ids if write else self.cfg.read_project_ids
         if write and not allowed:
             raise AccessDenied("Writes require a non-empty WEEEK_WRITE_PROJECT_IDS whitelist")
         if allowed and (not project_ids or not project_ids.issubset(allowed)):
-            denied = sorted(project_ids - allowed) if project_ids else ["unknown"]
+            denied: list[int] | list[str]
+            if project_ids:
+                denied = sorted(project_ids - allowed)
+            else:
+                denied = ["unknown"]
             raise AccessDenied(f"Project scope is not allowed: {denied}")
 
     async def project_ids_for(
@@ -47,25 +52,35 @@ class AccessPolicy:
             ids.add(int(args["project_id"]))
         if args.get("scope") == "project" and args.get("scope_id") is not None:
             ids.add(int(args["scope_id"]))
-        task_id = args.get("task_id")
-        if task_id is not None:
+        task_ids = [args.get("task_id")]
+        if tool_name in {"weeek_create_task", "weeek_set_task_parent"}:
+            task_ids.append(args.get("parent_id"))
+        if tool_name == "weeek_set_task_parent":
+            task_ids.extend((args.get("after"), args.get("before")))
+        for task_id in task_ids:
+            if task_id is None:
+                continue
             if api is None:
                 raise AccessDenied("Task scope cannot be verified without WEEEK_API_TOKEN")
-            ids.update(task_project_ids(await api.get_task(int(task_id))))
-        if args.get("board_id") is not None:
-            candidates = self.cfg.write_project_ids if write else self.cfg.read_project_ids
+            related = task_project_ids(await api.get_task(positive_int(task_id, "related task id")))
+            if not related:
+                raise AccessDenied("Related task project scope could not be proven")
+            ids.update(related)
+        candidates = self.cfg.write_project_ids if write else self.cfg.read_project_ids
+        board_refs = (
+            ("board_id", self._project_for_board),
+            ("upper_board_id", self._project_for_board),
+            ("board_column_id", self._project_for_column),
+            ("upper_board_column_id", self._project_for_column),
+        )
+        for key, resolver in board_refs:
+            if args.get(key) is None:
+                continue
             if not candidates:
                 return ids
             if api is None:
                 raise AccessDenied("Board scope cannot be verified without WEEEK_API_TOKEN")
-            ids.add(await self._project_for_board(int(args["board_id"]), api, candidates))
-        if args.get("board_column_id") is not None:
-            candidates = self.cfg.write_project_ids if write else self.cfg.read_project_ids
-            if not candidates:
-                return ids
-            if api is None:
-                raise AccessDenied("Board-column scope cannot be verified without WEEEK_API_TOKEN")
-            ids.add(await self._project_for_column(int(args["board_column_id"]), api, candidates))
+            ids.add(await resolver(int(args[key]), api, candidates))
         return ids
 
     async def _project_for_board(self, board_id: int, api: WeeekAPI, candidates: frozenset[int]) -> int:

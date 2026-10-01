@@ -31,6 +31,7 @@ def kb(monkeypatch, tmp_path):
     monkeypatch.setenv("WEEEK_STORAGE_STATE", str(tmp_path / "state.json"))
     monkeypatch.setenv("WEEEK_WORKSPACE_ID", "1")
     client = WeeekKB(Config.from_env())
+    client._ws = "1"  # this fixture stubs calls below the live workspace-discovery boundary
 
     async def fake_get(path, **kwargs):
         assert path == "/app/avatars"

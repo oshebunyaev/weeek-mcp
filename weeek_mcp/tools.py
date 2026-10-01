@@ -28,21 +28,22 @@ import re
 from pathlib import Path
 from typing import Any
 
-import mcp.types as types
+from mcp import types
 
 from .kb.client import KBDocument, WeeekKB
 from .kb.prosemirror import markdown_to_html, to_markdown
+from .validation import kb_doc_id, parse_kb_uri, validate_tool_ids
 from .weeek_api import WeeekAPI
 
 KB_URI_SCHEME = "weeek-kb"
 
 
 def kb_uri(doc_id: str) -> str:
-    return f"{KB_URI_SCHEME}://{doc_id}"
+    return f"{KB_URI_SCHEME}://{kb_doc_id(doc_id)}"
 
 
 def kb_doc_id_from_uri(uri: str) -> str:
-    return uri.split("://", 1)[-1].strip("/")
+    return parse_kb_uri(uri)
 
 
 # --------------------------------------------------------------------------- priorities
@@ -1152,6 +1153,7 @@ def _comments_digest(comments: list[dict]) -> list[dict]:
 
 
 async def handle_task_tool(name: str, args: dict[str, Any], api: WeeekAPI, kb: WeeekKB | None = None) -> Any:
+    args = validate_tool_ids(args)
     if name == "weeek_whoami":
         return await api.whoami()
     if name == "weeek_list_members":
@@ -1555,6 +1557,7 @@ def _doc_payload(doc: KBDocument) -> dict[str, Any]:
 
 
 async def handle_kb_tool(name: str, args: dict[str, Any], kb: WeeekKB) -> Any:
+    args = validate_tool_ids(args)
     if name == "weeek_kb_search":
         return [_doc_payload(d) for d in await kb.search(args["query"])]
     if name == "weeek_kb_list":

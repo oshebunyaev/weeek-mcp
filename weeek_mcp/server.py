@@ -15,13 +15,17 @@ import asyncio
 import hashlib
 import hmac
 import json
+import re
+import secrets
 import time
 from typing import Any
 
-import mcp.types as types
+import httpx
+from mcp import types
 from mcp.server import Server
 from mcp.server.stdio import stdio_server
 from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
+from mcp.server.transport_security import TransportSecuritySettings
 from pydantic import AnyUrl
 from starlette.responses import JSONResponse, PlainTextResponse
 
@@ -44,6 +48,7 @@ from .tools import (
     proposal_tools,
     read_tools,
 )
+from .validation import positive_int, validate_tool_ids
 from .weeek_api import WeeekAPI, WeeekAPIError
 
 
@@ -56,7 +61,14 @@ class WeeekServer:
         self.kb_available = config.storage_state_path.exists() or (config.kb_auto_login and config.has_kb_credentials)
         self._log = make_logger(config.log_path, "weeek-mcp")
         self._policy = AccessPolicy(config)
-        self._proposals = ProposalStore(config.proposals_db_path, config.proposal_ttl_seconds)
+        self._proposals = ProposalStore(
+            config.proposals_db_path,
+            config.proposal_ttl_seconds,
+            max_payload_bytes=config.proposal_max_payload_bytes,
+            max_pending=config.proposal_max_pending,
+            max_total=config.proposal_max_total,
+            retention_seconds=config.proposal_retention_seconds,
+        )
         self._register()
 
     # ------------------------------------------------------------- lazy deps
@@ -77,6 +89,12 @@ class WeeekServer:
         @self.server.list_tools()
         async def list_tools() -> list[types.Tool]:
             tools = read_tools(task=self.cfg.has_api, kb=self.kb_available)
+            if self.cfg.read_project_ids:
+                tools = [
+                    tool for tool in tools if tool.name not in {"weeek_get_attachment", "weeek_list_custom_fields"}
+                ]
+            if not self.cfg.allow_workspace_reads:
+                tools = [tool for tool in tools if tool.name not in {"weeek_whoami", "weeek_list_members"}]
             if self.cfg.allow_write:
                 tools += proposal_tools(task=self.cfg.has_api, kb=self.kb_available)
             return tools
@@ -94,6 +112,7 @@ class WeeekServer:
                 elif name in TASK_TOOL_NAMES:
                     if name not in {t.name for t in read_tools(task=True, kb=False)}:
                         raise AccessDenied("Direct write tools are disabled; use propose_* then confirm_write")
+                    args = validate_tool_ids(args)
                     await self._check_task_read(name, args)
                     # Task descriptions are only writable through the browser session,
                     # so the KB client rides along when one is available.
@@ -108,11 +127,13 @@ class WeeekServer:
                 else:
                     raise ValueError(f"Unknown tool: {name}")
             except WeeekAPIError as exc:
-                self._log(f"{name}: failed after {time.monotonic() - t0:.1f}s: Weeek API error {exc.status_code}")
-                raise ValueError(f"Weeek API error {exc.status_code}: {exc.body}") from exc
+                request_id = secrets.token_hex(6)
+                self._log(f"{name}: failed request_id={request_id} status={exc.status_code}")
+                raise ValueError(f"upstream_api_error status={exc.status_code} request_id={request_id}") from exc
             except KBError as exc:
-                self._log(f"{name}: failure after {time.monotonic() - t0:.1f}s: Knowledge base error")
-                raise ValueError(f"Knowledge base error: {exc}") from exc
+                request_id = secrets.token_hex(6)
+                self._log(f"{name}: failure request_id={request_id} category=knowledge_base_error")
+                raise ValueError(f"knowledge_base_error request_id={request_id}") from exc
             except Exception as exc:
                 self._log(f"{name}: failure after {time.monotonic() - t0:.1f}s: {type(exc).__name__}")
                 raise
@@ -148,7 +169,9 @@ class WeeekServer:
                 await self._check_kb_workspace()
                 return await self._get_kb().read_document(doc_id)
             except KBError as exc:
-                raise ValueError(f"Knowledge base error: {exc}") from exc
+                request_id = secrets.token_hex(6)
+                self._log(f"read_resource failure request_id={request_id} category=knowledge_base_error")
+                raise ValueError(f"knowledge_base_error request_id={request_id}") from exc
 
     async def _check_kb_workspace(self) -> None:
         actual = await self._get_kb().workspace()
@@ -158,7 +181,11 @@ class WeeekServer:
     def _log_ids(self, args: dict[str, Any]) -> str:
         fields = ["project_id", "task_id", "doc_id", "comment_id", "board_id", "board_column_id"]
         ids = [f"workspace_id={self.cfg.allowed_workspace_id}"] if self.cfg.allowed_workspace_id else []
-        ids.extend(f"{key}={args[key]}" for key in fields if args.get(key) is not None)
+
+        def safe(value: Any) -> str:
+            return re.sub(r"[^A-Za-z0-9_.:-]", "?", str(value))[:128]
+
+        ids.extend(f"{key}={safe(args[key])}" for key in fields if args.get(key) is not None)
         return " ".join(ids)
 
     @staticmethod
@@ -167,13 +194,45 @@ class WeeekServer:
         if missing:
             raise ValueError(f"Missing required arguments: {', '.join(missing)}")
 
+    @staticmethod
+    def _validated_arguments(name: str, args: dict[str, Any]) -> dict[str, Any]:
+        validated = validate_tool_ids(args)
+        if name == "weeek_set_task_parent":
+            for key in ("after", "before"):
+                if validated.get(key) is not None:
+                    validated[key] = positive_int(validated[key], key)
+        return validated
+
     async def _task_projects(self, name: str, args: dict[str, Any], *, write: bool) -> set[int]:
         return await self._policy.project_ids_for(name, args, self._get_api(), write=write)
 
     async def _check_task_read(self, name: str, args: dict[str, Any]) -> None:
+        if name in {"weeek_whoami", "weeek_list_members"} and not self.cfg.allow_workspace_reads:
+            raise AccessDenied("Workspace-wide reads require WEEEK_ALLOW_WORKSPACE_READS=true")
+        if name == "weeek_get_attachment" and self.cfg.read_project_ids:
+            raise AccessDenied("Attachment ownership cannot be proven while a project read allowlist is enabled")
+        if name == "weeek_list_custom_fields" and self.cfg.read_project_ids:
+            raise AccessDenied("Custom-field ownership cannot be proven while a project read allowlist is enabled")
+        await self._check_public_project_binding()
         projects = await self._task_projects(name, args, write=False)
-        if projects:
+        if self.cfg.read_project_ids and (projects or name not in {"weeek_list_projects", "weeek_list_tasks"}):
             self._policy.check_projects(projects, write=False)
+
+    async def _check_public_project_binding(self) -> None:
+        """Prove that the credential can see every configured project ID.
+
+        The documented Public API exposes no workspace identifier, so this is the
+        strongest available check; it does not turn the operator-provided workspace
+        label into a token-derived identity.
+        """
+        required = self.cfg.read_project_ids | self.cfg.write_project_ids
+        if not required:
+            return
+        data = await self._get_api().list_projects()
+        visible = {int(project["id"]) for project in data.get("projects") or [] if project.get("id") is not None}
+        missing = required - visible
+        if missing:
+            raise AccessDenied(f"WEEEK API credential cannot prove access to configured projects: {sorted(missing)}")
 
     def _filter_task_read(self, name: str, result: Any) -> Any:
         allowed = self.cfg.read_project_ids
@@ -183,14 +242,42 @@ class WeeekServer:
             result = dict(result)
             result["projects"] = [p for p in result.get("projects") or [] if int(p.get("id", -1)) in allowed]
         elif name == "weeek_list_tasks":
+
+            def allowed_task(task: dict[str, Any]) -> bool:
+                scope = {
+                    int(location["projectId"])
+                    for location in task.get("locations") or []
+                    if location.get("projectId") is not None
+                }
+                return bool(scope) and scope.issubset(allowed)
+
             result = dict(result)
-            result["tasks"] = [
-                task
-                for task in result.get("tasks") or []
-                if {int(x["projectId"]) for x in task.get("locations") or [] if x.get("projectId") is not None}
-                & allowed
-            ]
+            result["tasks"] = [task for task in result.get("tasks") or [] if allowed_task(task)]
+            result.pop("hasMore", None)
         return result
+
+    def _credential_fingerprint(self) -> str:
+        return hashlib.sha256((self.cfg.api_token or "no-public-api").encode()).hexdigest()
+
+    async def _state_fingerprint(self, name: str, args: dict[str, Any]) -> str:
+        state: dict[str, Any] = {}
+        task_ids = (
+            {args[key] for key in ("task_id", "parent_id", "after", "before") if args.get(key) is not None}
+            if name in PROPOSABLE_TASK_TOOL_NAMES
+            else set()
+        )
+        for task_id in sorted(task_ids):
+            state[f"task:{task_id}"] = await self._get_api().get_task(int(task_id))
+        if name == "weeek_update_task_comment" and args.get("comment_id") is not None:
+            comments = await self._get_kb().list_task_comments(int(args["task_id"]))
+            state["comment"] = next((c for c in comments if str(c.get("id")) == str(args["comment_id"])), None)
+        if name in PROPOSABLE_KB_TOOL_NAMES:
+            await self._check_kb_workspace()
+            for key in ("doc_id", "parent_id"):
+                if args.get(key) is not None:
+                    state[f"kb:{key}"] = await self._get_kb().read_document(str(args[key]))
+        encoded = json.dumps(state, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        return hashlib.sha256(encoded.encode()).hexdigest()
 
     async def _preview(self, name: str, args: dict[str, Any]) -> str:
         def compact(value: Any) -> Any:
@@ -236,6 +323,12 @@ class WeeekServer:
             raise AccessDenied("Writes are disabled (WEEEK_ALLOW_WRITE=false)")
         if name not in PROPOSABLE_TASK_TOOL_NAMES | PROPOSABLE_KB_TOOL_NAMES:
             raise AccessDenied(f"{name} is not available for safe writes")
+        args = self._validated_arguments(name, args)
+        if (
+            len(json.dumps(args, ensure_ascii=False, separators=(",", ":")).encode())
+            > self.cfg.proposal_max_payload_bytes
+        ):
+            raise ValueError("Proposal payload is too large")
         if name in {"weeek_add_task_comment", "weeek_update_task_comment"} and not self.kb_available:
             raise ValueError("Comment writes require a valid Knowledge Base browser session")
         if name == "weeek_update_task" and args.get("description") is not None and not self.kb_available:
@@ -246,6 +339,7 @@ class WeeekServer:
         self._validate_required(source, args)
         projects: set[int] = set()
         if name in PROPOSABLE_TASK_TOOL_NAMES:
+            await self._check_public_project_binding()
             if name in {"weeek_add_task_comment", "weeek_update_task_comment"} or (
                 name == "weeek_update_task" and args.get("description") is not None
             ):
@@ -255,16 +349,62 @@ class WeeekServer:
         else:
             await self._check_kb_workspace()
         preview = await self._preview(name, args)
-        token, expires_at = self._proposals.create(name, args, self._policy.workspace_id, projects, preview)
+        state_fingerprint = await self._state_fingerprint(name, args)
+        token, expires_at = self._proposals.create(
+            name,
+            args,
+            self._policy.workspace_id,
+            projects,
+            preview,
+            state_fingerprint=state_fingerprint,
+            credential_fingerprint=self._credential_fingerprint(),
+        )
         return {"preview": preview, "confirmation_token": token, "expires_at": expires_at}
 
     async def _confirm(self, args: dict[str, Any]) -> Any:
         if not self.cfg.allow_write:
             raise AccessDenied("Writes are disabled (WEEEK_ALLOW_WRITE=false)")
-        proposal = self._proposals.consume(str(args.get("confirmation_token") or ""))
+        proposal = self._proposals.claim(str(args.get("confirmation_token") or ""))
+        if proposal.status == "succeeded":
+            return proposal.result
+        try:
+            await self._validate_claimed(proposal)
+        except Exception:
+            self._proposals.finish(proposal, "failed_definite")
+            raise
+        try:
+            result = await self._execute_claimed(proposal)
+        except (httpx.TimeoutException, httpx.NetworkError) as exc:
+            self._proposals.finish(proposal, "indeterminate")
+            raise ValueError("write_outcome_indeterminate; do not retry this proposal") from exc
+        except KBError as exc:
+            self._proposals.finish(proposal, "indeterminate")
+            raise ValueError("write_outcome_indeterminate; do not retry this proposal") from exc
+        except WeeekAPIError as exc:
+            status = "indeterminate" if exc.status_code >= 500 else "failed_definite"
+            self._proposals.finish(proposal, status)
+            if status == "indeterminate":
+                raise ValueError("write_outcome_indeterminate; do not retry this proposal") from exc
+            raise
+        except Exception as exc:
+            self._proposals.finish(proposal, "indeterminate")
+            raise ValueError("write_outcome_indeterminate; do not retry this proposal") from exc
+        self._proposals.finish(proposal, "succeeded", result)
+        return result
+
+    async def _validate_claimed(self, proposal: Any) -> None:
+        validated = self._validated_arguments(proposal.tool_name, proposal.arguments)
+        if validated != proposal.arguments:
+            raise AccessDenied("Proposal contains non-canonical identifiers; create a new proposal")
         if proposal.workspace_id != self._policy.workspace_id:
             raise AccessDenied("Proposal workspace no longer matches server scope")
+        if proposal.credential_fingerprint != self._credential_fingerprint():
+            raise AccessDenied("WEEEK API credential changed after proposal; create a new proposal")
+        current_fingerprint = await self._state_fingerprint(proposal.tool_name, proposal.arguments)
+        if proposal.state_fingerprint != current_fingerprint:
+            raise AccessDenied("Relevant upstream state changed after proposal; create a new proposal")
         if proposal.tool_name in PROPOSABLE_TASK_TOOL_NAMES:
+            await self._check_public_project_binding()
             if proposal.tool_name in {"weeek_add_task_comment", "weeek_update_task_comment"} or (
                 proposal.tool_name == "weeek_update_task" and proposal.arguments.get("description") is not None
             ):
@@ -273,9 +413,13 @@ class WeeekServer:
             self._policy.check_projects(projects, write=True)
             if projects != set(proposal.project_ids):
                 raise AccessDenied("Object project scope changed after proposal; create a new proposal")
+        else:
+            await self._check_kb_workspace()
+
+    async def _execute_claimed(self, proposal: Any) -> Any:
+        if proposal.tool_name in PROPOSABLE_TASK_TOOL_NAMES:
             kb = self._get_kb() if self.kb_available else None
             return await handle_task_tool(proposal.tool_name, proposal.arguments, self._get_api(), kb)
-        await self._check_kb_workspace()
         return await handle_kb_tool(proposal.tool_name, proposal.arguments, self._get_kb())
 
     async def aclose(self) -> None:
@@ -302,7 +446,45 @@ class HTTPApplication:
 
     def __init__(self, weeek: WeeekServer):
         self.weeek = weeek
-        self.manager = StreamableHTTPSessionManager(weeek.server, json_response=True, stateless=True)
+        domain = weeek.cfg.mcp_domain or weeek.cfg.http_host
+        security = TransportSecuritySettings(
+            enable_dns_rebinding_protection=True,
+            allowed_hosts=[domain, f"{domain}:*"],
+            allowed_origins=list(weeek.cfg.allowed_origins),
+        )
+        self.manager = StreamableHTTPSessionManager(
+            weeek.server,
+            json_response=True,
+            stateless=True,
+            security_settings=security,
+        )
+
+    async def _bounded_body(self, receive: Any) -> tuple[Any | None, bool]:
+        """Buffer at most the configured limit and return a replay receive callable."""
+        messages: list[dict[str, Any]] = []
+        total = 0
+        while True:
+            message = await receive()
+            messages.append(message)
+            if message.get("type") == "http.request":
+                total += len(message.get("body", b""))
+                if total > self.weeek.cfg.http_max_body_bytes:
+                    return None, True
+                if not message.get("more_body", False):
+                    break
+            elif message.get("type") == "http.disconnect":
+                break
+        index = 0
+
+        async def replay() -> dict[str, Any]:
+            nonlocal index
+            if index < len(messages):
+                result = messages[index]
+                index += 1
+                return result
+            return {"type": "http.disconnect"}
+
+        return replay, False
 
     async def __call__(self, scope: dict[str, Any], receive: Any, send: Any) -> None:
         if scope["type"] == "lifespan":
@@ -324,8 +506,13 @@ class HTTPApplication:
         if path != "/mcp":
             await PlainTextResponse("Not found", status_code=404)(scope, receive, send)
             return
-        headers = {k.lower(): v for k, v in scope.get("headers", [])}
-        supplied = headers.get(b"authorization", b"").decode("latin-1")
+        auth_headers = [v for k, v in scope.get("headers", []) if k.lower() == b"authorization"]
+        if len(auth_headers) != 1 or scope.get("query_string"):
+            await JSONResponse({"error": "unauthorized"}, status_code=401, headers={"WWW-Authenticate": "Bearer"})(
+                scope, receive, send
+            )
+            return
+        supplied = auth_headers[0].decode("latin-1")
         expected = f"Bearer {self.weeek.cfg.auth_token or ''}"
         if not hmac.compare_digest(supplied, expected):
             await JSONResponse(
@@ -334,7 +521,30 @@ class HTTPApplication:
                 headers={"WWW-Authenticate": "Bearer"},
             )(scope, receive, send)
             return
-        await self.manager.handle_request(scope, receive, send)
+        header_pairs = scope.get("headers", [])
+        hosts = [v.decode("latin-1") for k, v in header_pairs if k.lower() == b"host"]
+        origins = [v.decode("latin-1") for k, v in header_pairs if k.lower() == b"origin"]
+        domain = self.weeek.cfg.mcp_domain or self.weeek.cfg.http_host
+        host_ok = len(hosts) == 1 and re.fullmatch(re.escape(domain) + r"(?::[0-9]{1,5})?", hosts[0])
+        if not host_ok:
+            await PlainTextResponse("Invalid Host header", status_code=421)(scope, receive, send)
+            return
+        if len(origins) > 1 or (origins and origins[0] not in self.weeek.cfg.allowed_origins):
+            await PlainTextResponse("Invalid Origin header", status_code=403)(scope, receive, send)
+            return
+        content_lengths = [v for k, v in scope.get("headers", []) if k.lower() == b"content-length"]
+        try:
+            declared = int(content_lengths[0]) if len(content_lengths) == 1 else 0
+        except ValueError:
+            declared = self.weeek.cfg.http_max_body_bytes + 1
+        if len(content_lengths) > 1 or declared > self.weeek.cfg.http_max_body_bytes:
+            await JSONResponse({"error": "request_too_large"}, status_code=413)(scope, receive, send)
+            return
+        bounded_receive, too_large = await self._bounded_body(receive)
+        if too_large or bounded_receive is None:
+            await JSONResponse({"error": "request_too_large"}, status_code=413)(scope, receive, send)
+            return
+        await self.manager.handle_request(scope, bounded_receive, send)
 
 
 async def _amain() -> None:

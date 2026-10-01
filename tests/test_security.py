@@ -27,6 +27,14 @@ def config(tmp_path: Path, **changes) -> Config:
         write_project_ids=frozenset({1}),
         proposals_db_path=tmp_path / "pending" / "proposals.sqlite3",
         proposal_ttl_seconds=600,
+        proposal_max_payload_bytes=65536,
+        proposal_max_pending=100,
+        proposal_max_total=1000,
+        proposal_retention_seconds=86400,
+        http_max_body_bytes=1048576,
+        mcp_domain="test",
+        allowed_origins=(),
+        allow_workspace_reads=False,
         api_token="api-secret",
         api_base="https://api.invalid",
         app_base="https://app.invalid",
@@ -63,6 +71,12 @@ def test_read_only_surface_and_delete_tools_absent():
     assert not {f"propose_{name}" for name in DELETE_TOOL_NAMES} & writable
 
 
+def test_write_is_disabled_by_default(monkeypatch):
+    monkeypatch.delenv("WEEEK_ALLOW_WRITE", raising=False)
+    monkeypatch.setenv("MCP_TRANSPORT", "stdio")
+    assert Config.from_env().allow_write is False
+
+
 def test_write_whitelist():
     policy = AccessPolicy(config(Path("/tmp")))
     policy.check_projects({1}, write=True)
@@ -77,6 +91,9 @@ class FakeAPI:
     async def create_task(self, body):
         self.created.append(body)
         return {"success": True, "task": {"id": 10}}
+
+    async def list_projects(self):
+        return {"projects": [{"id": 1}, {"id": 2}]}
 
     async def aclose(self):
         pass
@@ -93,8 +110,11 @@ async def test_proposal_does_not_write_and_confirm_uses_saved_payload(tmp_path):
     args["title"] = "tampered"
     await server._confirm({"confirmation_token": proposed["confirmation_token"]})
     assert api.created[0]["title"] == "original"
-    with pytest.raises(ProposalError, match="already been used"):
-        await server._confirm({"confirmation_token": proposed["confirmation_token"]})
+    assert await server._confirm({"confirmation_token": proposed["confirmation_token"]}) == {
+        "success": True,
+        "task": {"id": 10},
+    }
+    assert len(api.created) == 1
 
 
 def test_expired_confirmation_token(tmp_path):

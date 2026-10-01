@@ -11,6 +11,8 @@ from typing import Any
 
 import httpx
 
+from .validation import opaque_id, path_segment, uuid_id
+
 
 class WeeekAPIError(RuntimeError):
     """Raised when the Weeek API returns a non-2xx response."""
@@ -223,7 +225,8 @@ class WeeekAPI:
         return await self._request("POST", f"/tm/tasks/{task_id}/attachments", files=files)
 
     async def get_attachment(self, file_id: str) -> Any:
-        return await self._request("GET", f"/ws/attachments/{file_id}")
+        canonical = uuid_id(file_id, "file_id")
+        return await self._request("GET", f"/ws/attachments/{path_segment(canonical)}")
 
     # ------------------------------------------------------------------ custom fields
     def _custom_field_base(self, scope: str, scope_id: int | None) -> str:
@@ -241,14 +244,17 @@ class WeeekAPI:
         return await self._request("POST", self._custom_field_base(scope, scope_id), json=_clean(body))
 
     async def update_custom_field(self, scope: str, scope_id: int | None, field_id: str, body: dict[str, Any]) -> Any:
+        field_id = path_segment(opaque_id(field_id, "field_id"))
         return await self._request("PUT", f"{self._custom_field_base(scope, scope_id)}/{field_id}", json=_clean(body))
 
     async def delete_custom_field(self, scope: str, scope_id: int | None, field_id: str) -> Any:
+        field_id = path_segment(opaque_id(field_id, "field_id"))
         return await self._request("DELETE", f"{self._custom_field_base(scope, scope_id)}/{field_id}")
 
     async def transfer_custom_field(
         self, scope: str, scope_id: int | None, field_id: str, target: str, target_id: int | None
     ) -> Any:
+        field_id = path_segment(opaque_id(field_id, "field_id"))
         base = f"{self._custom_field_base(scope, scope_id)}/{field_id}"
         if target == "board":
             return await self._request("POST", f"{base}/transfer-to-board", json={"boardId": target_id})
@@ -259,16 +265,21 @@ class WeeekAPI:
     async def create_custom_field_option(
         self, scope: str, scope_id: int | None, field_id: str, body: dict[str, Any]
     ) -> Any:
+        field_id = path_segment(opaque_id(field_id, "field_id"))
         return await self._request("POST", f"{self._custom_field_base(scope, scope_id)}/{field_id}/options", json=body)
 
     async def update_custom_field_option(
         self, scope: str, scope_id: int | None, field_id: str, option_id: str, body: dict[str, Any]
     ) -> Any:
+        field_id = path_segment(opaque_id(field_id, "field_id"))
+        option_id = path_segment(opaque_id(option_id, "option_id"))
         return await self._request(
             "PUT", f"{self._custom_field_base(scope, scope_id)}/{field_id}/options/{option_id}", json=body
         )
 
     async def delete_custom_field_option(self, scope: str, scope_id: int | None, field_id: str, option_id: str) -> Any:
+        field_id = path_segment(opaque_id(field_id, "field_id"))
+        option_id = path_segment(opaque_id(option_id, "option_id"))
         return await self._request(
             "DELETE", f"{self._custom_field_base(scope, scope_id)}/{field_id}/options/{option_id}"
         )
@@ -276,6 +287,8 @@ class WeeekAPI:
     async def move_custom_field_option(
         self, scope: str, scope_id: int | None, field_id: str, option_id: str, body: dict[str, Any]
     ) -> Any:
+        field_id = path_segment(opaque_id(field_id, "field_id"))
+        option_id = path_segment(opaque_id(option_id, "option_id"))
         return await self._request(
             "POST", f"{self._custom_field_base(scope, scope_id)}/{field_id}/options/{option_id}/move", json=_clean(body)
         )

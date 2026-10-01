@@ -50,6 +50,7 @@ import httpx
 
 from ..config import Config
 from ..logging_util import make_logger
+from ..validation import kb_doc_id, opaque_id, path_segment, positive_int
 from . import collab
 from .prosemirror import markdown_to_doc, to_markdown
 from .session import KBAuthError, automated_login, load_cookies_into
@@ -171,7 +172,8 @@ class WeeekKB:
         self._cfg = config
         self._lock = asyncio.Lock()
         self._client: httpx.AsyncClient | None = None
-        self._ws: str | None = config.workspace_id
+        self._ws: str | None = None
+        self._requested_ws: str | None = config.workspace_id
         self._cache: list[KBDocument] | None = None
         self._cache_ts: float = 0.0
         self._icons: dict[str, str] = {}  # lowercased icon name -> id
@@ -242,7 +244,11 @@ class WeeekKB:
         workspaces = data.get("workspaces") or []
         if not workspaces:
             raise KBError("No workspaces available for this session.")
-        self._ws = str(workspaces[0]["id"])
+        available = {opaque_id(item["id"], "workspace_id") for item in workspaces if item.get("id") is not None}
+        requested = opaque_id(self._requested_ws, "workspace_id") if self._requested_ws is not None else None
+        if requested is not None and requested not in available:
+            raise KBError("Browser session does not have access to the configured workspace.")
+        self._ws = requested or opaque_id(workspaces[0]["id"], "workspace_id")
         return self._ws
 
     @property
@@ -294,6 +300,7 @@ class WeeekKB:
         return await self._search_articles(query.strip())
 
     async def read_document(self, doc_id: str) -> str:
+        doc_id = path_segment(kb_doc_id(doc_id))
         ws = await self._workspace()
         data = await self._get(f"/ws/{ws}/kb/articles/{doc_id}")
         article = data.get("article")
@@ -360,6 +367,8 @@ class WeeekKB:
         ``parentId`` in the article create/update body is silently ignored by the
         API — this is the only endpoint that actually reparents a document.
         """
+        doc_id = kb_doc_id(doc_id)
+        parent_id = positive_int(parent_id, "parent_id")
         ws = await self._workspace()
         await self._patch(
             f"/ws/{ws}/kb/hierarchy",
@@ -425,6 +434,7 @@ class WeeekKB:
         )
 
     async def _write_icon(self, doc_id: str, avatar: dict) -> str | None:
+        doc_id = path_segment(kb_doc_id(doc_id))
         ws = await self._workspace()
         await self._post(f"/ws/{ws}/kb/articles/{doc_id}/avatar", avatar)
         self._invalidate_cache()
@@ -435,6 +445,7 @@ class WeeekKB:
 
         Returns the label now shown for the document (None once cleared).
         """
+        doc_id = path_segment(kb_doc_id(doc_id))
         if not (icon or "").strip():
             ws = await self._workspace()
             await self._delete(f"/ws/{ws}/kb/articles/{doc_id}/avatar")
@@ -478,6 +489,7 @@ class WeeekKB:
         )
 
     async def rename_document(self, doc_id: str, title: str) -> None:
+        doc_id = path_segment(kb_doc_id(doc_id))
         ws = await self._workspace()
         await self._put(f"/ws/{ws}/kb/articles/{doc_id}", {"name": title})
         self._invalidate_cache()
@@ -489,6 +501,7 @@ class WeeekKB:
 
     async def _document_content(self, doc_id: str) -> dict:
         """The raw ProseMirror document behind an article."""
+        doc_id = path_segment(kb_doc_id(doc_id))
         ws = await self._workspace()
         data = await self._get(f"/ws/{ws}/kb/articles/{doc_id}")
         article = data.get("article")
@@ -504,6 +517,7 @@ class WeeekKB:
         Weeek takes whatever socket id it is given, so ours identifies this
         client rather than a Pusher connection.
         """
+        item_id = kb_doc_id(item_id) if kind == "article" else str(positive_int(item_id, "task_id"))
         ws = await self._workspace()
         collection = "kb/articles" if kind == "article" else "tm/tasks"
         data = await self._post(
@@ -717,6 +731,7 @@ class WeeekKB:
         }
 
     async def delete_document(self, doc_id: str, *, permanent: bool = False) -> None:
+        doc_id = path_segment(kb_doc_id(doc_id))
         ws = await self._workspace()
         await self._delete(f"/ws/{ws}/kb/articles/{doc_id}/trash")  # move to trash
         if permanent:
@@ -725,6 +740,7 @@ class WeeekKB:
 
     # ------------------------------------------------------------- task comments
     async def list_task_comments(self, task_id: int) -> list[dict]:
+        task_id = positive_int(task_id, "task_id")
         ws = await self._workspace()
         data = await self._get(f"/ws/{ws}/tm/tasks/{task_id}/comments")
         return data.get("comments") or []
@@ -738,6 +754,7 @@ class WeeekKB:
         ``{"content": {"data": ...}}``, answers 500 after writing a comment nested one level too
         deep, so the doc goes in bare.
         """
+        task_id = positive_int(task_id, "task_id")
         ws = await self._workspace()
         data = await self._post(
             f"/ws/{ws}/tm/tasks/{task_id}/comments",
@@ -747,6 +764,8 @@ class WeeekKB:
 
     async def update_task_comment(self, task_id: int, comment_id: int, markdown: str) -> dict:
         """Rewrite a comment in place, so the thread keeps one entry instead of gaining a second."""
+        task_id = positive_int(task_id, "task_id")
+        comment_id = positive_int(comment_id, "comment_id")
         ws = await self._workspace()
         data = await self._put(
             f"/ws/{ws}/tm/tasks/{task_id}/comments/{comment_id}",
@@ -756,5 +775,7 @@ class WeeekKB:
 
     async def delete_task_comment(self, task_id: int, comment_id: int) -> None:
         """Remove a comment. Weeek has no trash for these — it is gone."""
+        task_id = positive_int(task_id, "task_id")
+        comment_id = positive_int(comment_id, "comment_id")
         ws = await self._workspace()
         await self._delete(f"/ws/{ws}/tm/tasks/{task_id}/comments/{comment_id}")
