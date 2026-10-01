@@ -213,6 +213,25 @@ def test_terminal_proposal_retention_is_row_bounded(tmp_path):
         assert db.execute("SELECT COUNT(*) FROM proposals").fetchone()[0] <= 3
 
 
+def test_cleanup_never_removes_executing_proposals(tmp_path):
+    store = ProposalStore(tmp_path / "p.sqlite", max_pending=4, max_total=4)
+    executing = []
+    for index in range(3):
+        token, _ = store.create("x", {"index": index}, "ws", set(), "p")
+        executing.append(store.claim(token))
+
+    store.create("x", {"pending": 1}, "ws", set(), "p")
+    # The store is at max_total, and this create invokes cleanup again. Active
+    # records may temporarily make the database exceed its terminal-row budget.
+    store.create("x", {"pending": 2}, "ws", set(), "p")
+    with sqlite3.connect(store.path) as db:
+        statuses = dict(db.execute("SELECT token_hash, status FROM proposals"))
+    assert all(statuses[proposal.token_hash] == "executing" for proposal in executing)
+
+    for index, proposal in enumerate(executing):
+        store.finish(proposal, "succeeded", {"index": index})
+
+
 def test_legacy_consumed_tokens_migrate_to_indeterminate(tmp_path):
     path = tmp_path / "legacy.sqlite"
     token = "legacy-token"
@@ -286,6 +305,26 @@ class MutableTaskAPI:
     async def update_task(self, task_id, body):
         self.writes += 1
         return {"task": {"id": task_id, **body}}
+
+
+async def test_proposal_rejects_state_change_while_building_preview(tmp_path, monkeypatch):
+    server = WeeekServer(config(tmp_path, allow_write=True))
+    api = MutableTaskAPI()
+    server._api = api
+    original_preview = server._preview
+
+    async def preview_then_external_change(name, args):
+        preview = await original_preview(name, args)
+        api.title = "changed while preview was being prepared"
+        return preview
+
+    monkeypatch.setattr(server, "_preview", preview_then_external_change)
+    with pytest.raises(AccessDenied, match="changed while preparing proposal"):
+        await server._propose("weeek_update_task", {"task_id": 7, "title": "after"})
+
+    with sqlite3.connect(server._proposals.path) as db:
+        assert db.execute("SELECT COUNT(*) FROM proposals").fetchone()[0] == 0
+    assert api.writes == 0
 
 
 async def test_stale_upstream_state_rejects_before_write(tmp_path):

@@ -348,15 +348,18 @@ class WeeekServer:
             self._policy.check_projects(projects, write=True)
         else:
             await self._check_kb_workspace()
-        preview = await self._preview(name, args)
         state_fingerprint = await self._state_fingerprint(name, args)
+        preview = await self._preview(name, args)
+        state_fingerprint_after_preview = await self._state_fingerprint(name, args)
+        if not hmac.compare_digest(state_fingerprint, state_fingerprint_after_preview):
+            raise AccessDenied("Relevant upstream state changed while preparing proposal; create a new proposal")
         token, expires_at = self._proposals.create(
             name,
             args,
             self._policy.workspace_id,
             projects,
             preview,
-            state_fingerprint=state_fingerprint,
+            state_fingerprint=state_fingerprint_after_preview,
             credential_fingerprint=self._credential_fingerprint(),
         )
         return {"preview": preview, "confirmation_token": token, "expires_at": expires_at}

@@ -51,19 +51,29 @@ Streamable HTTP transport. HTTP exposes exactly `/mcp` and the unauthenticated
 - Public task payloads expose workspace-wide custom-field metadata without a trustworthy field-to-project mapping. `weeek_list_custom_fields` is likewise disabled under a project read allowlist.
 - Workspace-wide identity/member reads are disabled unless `WEEEK_ALLOW_WORKSPACE_READS=true`; they are not represented as project-scoped operations.
 - Direct write tools are not advertised. Each permitted write is exposed as `propose_weeek_*`; it validates scope, reads the current object, returns a preview and a one-time token, and performs no mutation.
-- `confirm_write` accepts only that token. The original payload is loaded from SQLite, credential, scope, related objects, and upstream-state fingerprints are checked again, then the proposal is atomically claimed. Durable states distinguish `succeeded`, definite failure, and an indeterminate post-send outcome; an indeterminate proposal is never executed automatically again. Successful results are safe to fetch again. Default TTL is 10 minutes.
+- `confirm_write` accepts only that token. The original payload is loaded from SQLite, credential, scope, related objects, and upstream-state fingerprints are checked again, then the proposal is atomically claimed. Preview generation is bracketed by two state-fingerprint reads; a proposal is not created if they differ. Durable states distinguish `succeeded`, definite failure, and an indeterminate post-send outcome; an indeterminate proposal is never executed automatically again. Successful results are safe to fetch again. Default TTL is 10 minutes.
 - `weeek_delete_task`, `weeek_delete_task_comment`, and `weeek_kb_delete` are never exported.
 - Read tools and proposal tools carry `readOnlyHint=true`; `confirm_write` is annotated as modifying.
 
 The documented Public API does **not** return a trustworthy workspace id for an
 API token. `WEEEK_ALLOWED_WORKSPACE_ID` is therefore an operator assertion, not
-a token-derived identity guarantee. The server makes the strongest documented
+a token-derived identity guarantee. Public API workspace identity cannot be
+cryptographically or atomically verified using the documented WEEEK Public API,
+and the documentation does not guarantee that project ids are globally unique.
+The server makes the strongest documented
 check available: every configured project id must be visible to the credential,
 and proposals are bound to a fingerprint of that credential so token rotation
 invalidates them. Avoid reusing project allowlist configuration across
 workspaces. The KB client independently discovers the browser session's live
 workspace list through `/ws` and refuses a configured workspace that is absent;
 the Public API and KB session cannot silently select different configured ids.
+
+The documented Public API also provides no conditional task write using an
+ETag, object version, or equivalent precondition. Confirmation therefore checks
+scope and the stored state fingerprint immediately before sending the write,
+but an external mutation can still occur in the residual interval between that
+check and the upstream request. This deployment does not claim strict atomic
+project isolation against concurrent external mutations.
 
 All endpoint identifiers are validated as canonical integers, UUIDs, or bounded
 opaque ids as appropriate, then encoded as path segments. Traversal, separators,

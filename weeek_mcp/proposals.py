@@ -103,17 +103,20 @@ class ProposalStore:
         return hashlib.sha256(token.encode()).hexdigest()
 
     def _cleanup(self, db: sqlite3.Connection, now: int) -> None:
+        terminal = tuple(sorted(self.TERMINAL))
+        placeholders = ",".join("?" for _ in terminal)
         db.execute("DELETE FROM proposals WHERE status='pending' AND expires_at < ?", (now,))
         db.execute(
-            "DELETE FROM proposals WHERE status != 'pending' AND COALESCE(finished_at, expires_at) < ?",
-            (now - self.retention_seconds,),
+            f"""DELETE FROM proposals WHERE status IN ({placeholders})
+                AND COALESCE(finished_at, expires_at) < ?""",
+            (*terminal, now - self.retention_seconds),
         )
         db.execute(
-            """DELETE FROM proposals WHERE token_hash IN (
-                SELECT token_hash FROM proposals WHERE status != 'pending'
+            f"""DELETE FROM proposals WHERE token_hash IN (
+                SELECT token_hash FROM proposals WHERE status IN ({placeholders})
                 ORDER BY COALESCE(finished_at, expires_at) DESC LIMIT -1 OFFSET ?
             )""",
-            (self.max_total - self.max_pending,),
+            (*terminal, self.max_total - self.max_pending),
         )
 
     def create(
