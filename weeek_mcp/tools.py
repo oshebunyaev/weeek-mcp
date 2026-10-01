@@ -1621,3 +1621,106 @@ async def handle_kb_tool(name: str, args: dict[str, Any], kb: WeeekKB) -> Any:
 
 TASK_TOOL_NAMES = {t.name for t in TASK_TOOLS}
 KB_TOOL_NAMES = {t.name for t in KB_TOOLS}
+
+# Production-safe surface. Direct mutating tools are never advertised: enabled
+# writes are exposed as proposal tools and executed only through confirm_write.
+DELETE_TOOL_NAMES = {"weeek_delete_task", "weeek_delete_task_comment", "weeek_kb_delete"}
+READ_TASK_TOOL_NAMES = {
+    "weeek_whoami",
+    "weeek_list_members",
+    "weeek_list_projects",
+    "weeek_list_boards",
+    "weeek_list_board_columns",
+    "weeek_list_tasks",
+    "weeek_get_task",
+    "weeek_list_custom_fields",
+    "weeek_list_task_comments",
+    "weeek_get_attachment",
+}
+READ_KB_TOOL_NAMES = {"weeek_kb_search", "weeek_kb_list", "weeek_kb_read", "weeek_kb_icons"}
+PROPOSABLE_TASK_TOOL_NAMES = {
+    "weeek_create_task",
+    "weeek_update_task",
+    "weeek_complete_task",
+    "weeek_uncomplete_task",
+    "weeek_move_task",
+    "weeek_set_assignees",
+    "weeek_remove_assignees",
+    "weeek_set_task_parent",
+    "weeek_add_task_to_project",
+    "weeek_remove_task_from_project",
+    "weeek_set_watchers",
+    "weeek_remove_watchers",
+    "weeek_add_task_comment",
+    "weeek_update_task_comment",
+}
+PROPOSABLE_KB_TOOL_NAMES = {
+    "weeek_kb_create",
+    "weeek_kb_update",
+    "weeek_kb_table_widths",
+    "weeek_kb_move",
+}
+PROPOSABLE_TOOL_NAMES = PROPOSABLE_TASK_TOOL_NAMES | PROPOSABLE_KB_TOOL_NAMES
+
+
+def _annotated(tool: types.Tool, *, read_only: bool) -> types.Tool:
+    return tool.model_copy(
+        update={
+            "annotations": types.ToolAnnotations(
+                readOnlyHint=read_only,
+                destructiveHint=False,
+                idempotentHint=True if read_only else False,
+                openWorldHint=True,
+            )
+        }
+    )
+
+
+def read_tools(*, task: bool, kb: bool) -> list[types.Tool]:
+    selected: list[types.Tool] = []
+    if task:
+        selected.extend(t for t in TASK_TOOLS if t.name in READ_TASK_TOOL_NAMES)
+    if kb:
+        selected.extend(t for t in KB_TOOLS if t.name in READ_KB_TOOL_NAMES)
+    return [_annotated(t, read_only=True) for t in selected]
+
+
+def proposal_tools(*, task: bool, kb: bool) -> list[types.Tool]:
+    source: list[types.Tool] = []
+    if task:
+        source.extend(t for t in TASK_TOOLS if t.name in PROPOSABLE_TASK_TOOL_NAMES)
+    if kb:
+        source.extend(t for t in KB_TOOLS if t.name in PROPOSABLE_KB_TOOL_NAMES)
+    result = [
+        types.Tool(
+            name=f"propose_{tool.name}",
+            description=f"Validate and preview {tool.name}; does not modify WEEEK. Returns a one-time confirmation token.",
+            inputSchema=tool.inputSchema,
+            annotations=types.ToolAnnotations(
+                readOnlyHint=True,
+                destructiveHint=False,
+                idempotentHint=False,
+                openWorldHint=True,
+            ),
+        )
+        for tool in source
+    ]
+    result.append(
+        types.Tool(
+            name="confirm_write",
+            description="Execute exactly the stored write proposal once. The payload cannot be changed at confirmation time.",
+            inputSchema={
+                "type": "object",
+                "properties": {"confirmation_token": {"type": "string"}},
+                "required": ["confirmation_token"],
+                "additionalProperties": False,
+            },
+            annotations=types.ToolAnnotations(
+                readOnlyHint=False,
+                destructiveHint=False,
+                idempotentHint=False,
+                openWorldHint=True,
+            ),
+        )
+    )
+    return result

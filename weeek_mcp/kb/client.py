@@ -196,6 +196,11 @@ class WeeekKB:
         return self._client
 
     async def _refresh_session(self) -> None:
+        if not self._cfg.kb_auto_login:
+            raise KBError(
+                "Knowledge Base session expired. Refresh WEEEK_STORAGE_STATE with "
+                "`weeek-mcp-login`; automatic login is disabled."
+            )
         t0 = time.monotonic()
         self._log("session refresh: starting automated login")
         try:

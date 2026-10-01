@@ -30,6 +30,7 @@ async def _run() -> None:
 
         cfg.storage_state_path.parent.mkdir(parents=True, exist_ok=True)
         await context.storage_state(path=str(cfg.storage_state_path))
+        cfg.storage_state_path.chmod(0o600)
         print(f"Session saved to {cfg.storage_state_path}")
         await browser.close()
 
