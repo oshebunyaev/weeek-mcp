@@ -1,0 +1,62 @@
+services:
+  weeek-mcp:
+    build:
+      context: .
+      target: ${WEEEK_DOCKER_TARGET:-runtime-kb}
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      MCP_TRANSPORT: http
+      MCP_HTTP_HOST: 0.0.0.0
+      MCP_HTTP_PORT: 8000
+      WEEEK_STORAGE_STATE: /data/session/storage_state.json
+      WEEEK_PROPOSALS_DB: /data/pending/proposals.sqlite3
+    expose:
+      - "8000"
+    volumes:
+      - weeek-session:/data/session
+      - weeek-proposals:/data/pending
+    networks:
+      - internal
+      - egress
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    read_only: true
+    tmpfs:
+      - /tmp:size=256m,mode=1777
+
+  reverse-proxy:
+    image: caddy:2.10.2-alpine
+    restart: unless-stopped
+    environment:
+      MCP_DOMAIN: ${MCP_DOMAIN:-weeek-mcp.example.com}
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+    networks:
+      - internal
+      - egress
+    depends_on:
+      weeek-mcp:
+        condition: service_healthy
+    security_opt:
+      - no-new-privileges:true
+
+networks:
+  internal:
+    internal: true
+  egress:
+
+volumes:
+  weeek-session:
+  weeek-proposals:
+  caddy-data:
+  caddy-config:
