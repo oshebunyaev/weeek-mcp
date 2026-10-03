@@ -121,6 +121,7 @@ async def _automated_login(cfg: Config) -> None:
 
             cfg.storage_state_path.parent.mkdir(parents=True, exist_ok=True)
             await context.storage_state(path=str(cfg.storage_state_path))
+            cfg.storage_state_path.chmod(0o600)
             log(f"login: succeeded in {time.monotonic() - t0:.1f}s")
         finally:
             await browser.close()

@@ -52,7 +52,7 @@ async def test_unknown_tool_raises():
 
 
 def test_kb_uri_roundtrip():
-    assert tools.kb_doc_id_from_uri(tools.kb_uri("abc123")) == "abc123"
+    assert tools.kb_doc_id_from_uri(tools.kb_uri("123")) == "123"
 
 
 def _type_array_paths(node, path):

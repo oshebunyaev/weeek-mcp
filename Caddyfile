@@ -1,0 +1,20 @@
+{$MCP_DOMAIN:weeek-mcp.example.com} {
+    encode zstd gzip
+
+    @mcp path /mcp
+    handle @mcp {
+        request_body {
+            max_size 1MB
+        }
+        reverse_proxy weeek-mcp:8000
+    }
+
+    @health path /health
+    handle @health {
+        reverse_proxy weeek-mcp:8000
+    }
+
+    handle {
+        respond "Not found" 404
+    }
+}
